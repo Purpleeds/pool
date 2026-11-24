@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1c1511">
+<title>Pool</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&family=Big+Shoulders+Display:wght@700;800;900&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='30' fill='%23141414'/%3E%3Ccircle cx='32' cy='30' r='13' fill='%23f4efe4'/%3E%3Ctext x='32' y='37' font-family='Arial' font-weight='700' font-size='18' text-anchor='middle'%3E8%3C/text%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main id="app">
+
+  <section id="lobby" class="screen active" aria-labelledby="title">
+    <div class="lamp" aria-hidden="true"></div>
+    <canvas id="hero" class="hero" aria-hidden="true"></canvas>
+    <h1 id="title" class="title">Pool</h1>
+    <p class="tagline">8-ball against a friend, on their screen or yours.</p>
+    <div class="lobby-form">
+      <label class="field" for="name">Your name</label>
+      <input id="name" maxlength="16" autocomplete="nickname" placeholder="Enter a name" spellcheck="false">
+      <div class="lobby-actions">
+        <button id="btn-create" class="btn primary" type="button">Create room</button>
+        <form id="join-form" class="join">
+          <input id="code" maxlength="4" placeholder="Code" autocapitalize="characters" autocomplete="off" spellcheck="false" aria-label="Room code">
+          <button class="btn" type="submit">Join</button>
+        </form>
+      </div>
+      <button id="btn-local" class="btn link" type="button">Play on this device instead</button>
+      <p id="lobby-error" class="error" role="alert"></p>
+    </div>
+  </section>
+
+  <section id="waiting" class="screen" aria-live="polite">
+    <div class="lamp" aria-hidden="true"></div>
+    <p class="wait-label">Room code</p>
+    <div id="room-code" class="code">····</div>
+    <p class="hint">Send this to a friend. They open the game, type the code and press Join.</p>
+    <div class="row">
+      <button id="btn-copy" class="btn primary" type="button">Copy invite link</button>
+      <button id="btn-cancel" class="btn" type="button">Leave room</button>
+    </div>
+    <p id="wait-msg" class="muted">Waiting for your opponent…</p>
+  </section>
+
+  <section id="game" class="screen">
+    <header class="hud">
+      <div class="player" id="p0"><div class="pname"></div><div class="pballs"></div></div>
+      <div class="status" id="status" aria-live="polite"></div>
+      <div class="player right" id="p1"><div class="pname"></div><div class="pballs"></div></div>
+    </header>
+    <div class="stage">
+      <div class="table-wrap" id="table-wrap">
+        <canvas id="table" aria-label="Pool table"></canvas>
+        <div id="toast" class="toast" role="status"></div>
+      </div>
+      <aside class="controls" aria-label="Shot controls">
+        <div id="power" class="power" title="Pull down and let go to shoot">
+          <div class="power-track"><div class="power-fill"></div></div>
+          <div class="power-label">Power</div>
+        </div>
+        <div class="spin-box">
+          <div id="spin" class="spin" title="Tap high for follow, low for draw. Double-tap to reset."><div class="spin-dot"></div></div>
+          <div class="power-label">Spin</div>
+        </div>
+        <div class="fine" aria-label="Fine aim">
+          <button id="aim-l" type="button" aria-label="Rotate aim left">◀</button>
+          <button id="aim-r" type="button" aria-label="Rotate aim right">▶</button>
+        </div>
+      </aside>
+    </div>
+    <footer class="bar">
+      <button id="btn-leave" type="button">Leave</button>
+      <span id="room-label" class="room-label"></span>
+      <span class="spacer"></span>
+      <button id="btn-help" type="button">How to play</button>
+      <button id="btn-sound" type="button">Sound on</button>
+    </footer>
+
+    <div id="over" class="overlay" hidden>
+      <div class="card">
+        <h2 id="over-title"></h2>
+        <p id="over-reason"></p>
+        <div class="row">
+          <button id="btn-rematch" class="btn primary" type="button">Rematch</button>
+          <button id="btn-over-leave" class="btn" type="button">Leave</button>
+        </div>
+        <p id="over-note" class="muted"></p>
+      </div>
+    </div>
+
+    <div id="help" class="overlay" hidden>
+      <div class="card help">
+        <h2>How to play</h2>
+        <dl>
+          <dt>Aim</dt><dd>Press and drag anywhere on the table and the cue follows. Fine-tune with ◀ ▶ or the arrow keys.</dd>
+          <dt>Shoot</dt><dd>Pull the power bar down and let go. You can also drag back from the cue ball and release, or hold the space bar and let go.</dd>
+          <dt>Spin</dt><dd>Tap high on the spin ball for follow, low for draw.</dd>
+          <dt>Rules</dt><dd>Pot all of your group, solids (1–7) or stripes (9–15), then the 8. The table stays open after the break until someone pots a ball. A scratch, hitting the wrong ball first, or no ball reaching a cushion is a foul, and your opponent gets ball in hand: they drag the cue ball anywhere. Pot the 8 early, or scratch while potting it, and you lose.</dd>
+        </dl>
+        <div class="row"><button id="btn-help-close" class="btn primary" type="button">Got it</button></div>
+      </div>
+    </div>
+  </section>
+
+</main>
+<script src="/socket.io/socket.io.js"></script>
+<script src="core.js"></script>
+<script src="client.js"></script>
+</body>
+</html>

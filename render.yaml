@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: pool
+    runtime: node
+    region: singapore
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /healthz
+    autoDeploy: true

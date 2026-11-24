@@ -42,7 +42,7 @@ function roomView(room, seat) {
   return {
     code: room.code, you: seat, gameId: room.gameId, state: room.state,
     players: room.players.map((p) => (p ? { name: p.name, connected: p.connected } : null)),
-    spectators: room.spectators.size, rematch: room.rematch.slice(),
+    spectators: room.spectators.size, rematch: room.rematch.slice(), score: room.score.slice(),
   };
 }
 
@@ -52,7 +52,8 @@ function broadcastRoom(room) {
   }
 }
 
-function startGame(room) {
+function startGame(room, newOpponent) {
+  if (newOpponent) room.score = [0, 0];
   room.gameId++;
   room.state = Core.newGame(room.breaker);
   room.rematch = [false, false];
@@ -79,7 +80,7 @@ function attach(socket, room, name, clientId) {
     seat = room.players.findIndex((p) => !p);
     if (seat >= 0) {
       room.players[seat] = { clientId, name, socketId: socket.id, connected: true, lastSeen: Date.now() };
-      if (room.players[0] && room.players[1]) startGame(room);
+      if (room.players[0] && room.players[1]) startGame(room, true);
     } else {
       seat = -1;
       room.spectators.add(socket.id);
@@ -106,7 +107,7 @@ io.on('connection', (socket) => {
     const code = newCode();
     const room = {
       code, players: [null, null], spectators: new Set(), state: null, gameId: 0,
-      rematch: [false, false], breaker: 0, busyUntil: 0, emptySince: 0, createdAt: Date.now(),
+      rematch: [false, false], breaker: 0, busyUntil: 0, emptySince: 0, createdAt: Date.now(), score: [0, 0],
     };
     rooms.set(code, room);
     const seat = attach(socket, room, cleanName(msg.name), clientId);
@@ -139,8 +140,8 @@ io.on('connection', (socket) => {
     if (!res.ok) return socket.emit('shotRejected', res.error);
     room.state = res.state;
     room.busyUntil = Date.now() + res.steps * Core.DT * 1000 - 600;
-    io.to(room.code).emit('shot', { gameId: room.gameId, start: st, input: res.input, result: res.state });
-    if (res.state.phase === 'over') room.breaker = 1 - room.breaker;
+    if (res.state.phase === 'over') { room.score[res.state.winner]++; room.breaker = 1 - room.breaker; }
+    io.to(room.code).emit('shot', { gameId: room.gameId, start: st, input: res.input, result: res.state, score: room.score.slice() });
   });
 
   socket.on('aim', (a) => {

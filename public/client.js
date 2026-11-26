@@ -44,11 +44,12 @@
     state: null, anim: null, pending: false, pendingTimer: 0,
     aim: { dx: 1, dy: 0 }, power: 0, spin: 0, charging: false,
     place: null, drag: null,
-    remote: { aim: null, place: null },
+    remote: { aim: null, place: null, view: null, placeView: null },
     strike: null, potAnims: [], online: false,
     aimDirty: false, placeDirty: false, lastSend: 0,
   };
 
+  let lastCaption = '';
   const myName = () => ($('#name').value.trim().slice(0, 16) || 'Player 1');
   function seatName(seat) {
     if (app.mode === 'local') return app.localNames[seat];
@@ -68,7 +69,7 @@
     const s = app.state;
     if (s.ballInHand) {
       if (myTurn() && app.place) return app.place;
-      if (!myTurn() && app.remote.place) return app.remote.place;
+      if (!myTurn() && app.remote.placeView) return app.remote.placeView;
     }
     const c = cueBall(s);
     return { x: c.x, y: c.y };
@@ -76,19 +77,21 @@
 
   // ------------------------------------------------------------------ renderer
   function makeRenderer(canvas, allowRotate) {
-    const r = { canvas, ctx: canvas.getContext('2d'), scale: 1, ox: 0, oy: 0, dpr: 1, layer: null, sprites: {}, shadow: null, rot: false, allowRotate };
+    const r = { canvas, ctx: canvas.getContext('2d'), scale: 1, ox: 0, oy: 0, dpr: 1, layer: null, px: null, ballCache: {}, orient: makeOrients(), shadow: null, rot: false, allowRotate };
     r.resize = () => {
       const rect = canvas.getBoundingClientRect();
       if (rect.width < 2 || rect.height < 2) return;
       r.dpr = Math.min(window.devicePixelRatio || 1, 2.5);
       canvas.width = Math.round(rect.width * r.dpr);
       canvas.height = Math.round(rect.height * r.dpr);
-      r.rot = r.allowRotate && rect.height > rect.width * 1.15; // upright phones: stand the table on its end
+      // stand the table on its end whenever that makes it noticeably bigger (upright phones and tablets)
+      const flat = Math.min(rect.width / WORLD_W, rect.height / WORLD_H), upright = Math.min(rect.width / WORLD_H, rect.height / WORLD_W);
+      r.rot = r.allowRotate && upright > flat * 1.04;
       const vw = r.rot ? WORLD_H : WORLD_W, vh = r.rot ? WORLD_W : WORLD_H;
       r.scale = Math.min(rect.width / vw, rect.height / vh);
       r.ox = (rect.width - vw * r.scale) / 2;
       r.oy = (rect.height - vh * r.scale) / 2;
-      buildLayer(r); buildSprites(r);
+      buildLayer(r); buildBallPixels(r);
     };
     r.toWorld = (cx, cy) => {
       const rect = canvas.getBoundingClientRect();
@@ -107,10 +110,37 @@
   }
   const capture = (el, id) => { try { el.setPointerCapture(id); } catch (e) { /* pointer already gone */ } };
 
-  function roundRect(ctx, x, y, w, h, rad) {
-    ctx.beginPath();
+  function rrect(ctx, x, y, w, h, rad) { // adds a rounded-rect subpath to the current path
     ctx.moveTo(x + rad, y); ctx.arcTo(x + w, y, x + w, y + h, rad); ctx.arcTo(x + w, y + h, x, y + h, rad);
     ctx.arcTo(x, y + h, x, y, rad); ctx.arcTo(x, y, x + w, y, rad); ctx.closePath();
+  }
+  function roundRect(ctx, x, y, w, h, rad) { ctx.beginPath(); rrect(ctx, x, y, w, h, rad); }
+  function boundaryPath(ctx) {
+    ctx.beginPath();
+    BOUNDARY.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
+    ctx.closePath();
+  }
+  const CLOTH = [31, 102, 184];
+  let feltTile = null;
+  function makeFeltTile() {
+    // fine wool texture: random fibres plus a faint weave, tiled across the bed
+    const S = 192, cv = document.createElement('canvas'); cv.width = cv.height = S; // divisible by the weave periods, so it tiles seamlessly
+    const ctx = cv.getContext('2d'), img = ctx.createImageData(S, S), d = img.data;
+    let seed = 99; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (let y = 0; y < S; y++) for (let x = 0; x < S; x++) {
+      const i = (y * S + x) * 4, weave = ((x + y) % 4 === 0 ? 10 : 0) + ((x - y + S) % 6 === 0 ? 6 : 0);
+      const v = 128 + (rnd() - 0.5) * 70 + weave;
+      d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+    for (let i = 0; i < 260; i++) { // stray fibres
+      ctx.strokeStyle = rnd() < 0.5 ? 'rgba(255,255,255,0.18)' : 'rgba(0,0,0,0.18)'; ctx.lineWidth = 0.6;
+      const x = rnd() * S, y = rnd() * S, a = rnd() * Math.PI * 2, l = 2 + rnd() * 5;
+      for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) { // wrap fibres across tile edges
+        ctx.beginPath(); ctx.moveTo(x + ox, y + oy); ctx.lineTo(x + ox + Math.cos(a) * l, y + oy + Math.sin(a) * l); ctx.stroke();
+      }
+    }
+    return cv;
   }
 
   function buildLayer(r) {
@@ -118,142 +148,324 @@
     cv.width = r.canvas.width; cv.height = r.canvas.height;
     const ctx = cv.getContext('2d');
     const k = r.dpr * r.scale;
-    ctx.setTransform(...r.matrix());
+    const world = () => ctx.setTransform(...r.matrix());
+    world();
 
-    // table shadow on the arena floor
+    // the table's shadow on the floor
     ctx.save();
-    ctx.shadowColor = 'rgba(2,5,18,0.6)'; ctx.shadowBlur = 46 * k;
-    if (r.rot) ctx.shadowOffsetX = 16 * k; else ctx.shadowOffsetY = 16 * k;
-    roundRect(ctx, -PAD, -PAD, WORLD_W, WORLD_H, 26); ctx.fillStyle = '#1B1E24'; ctx.fill();
+    ctx.shadowColor = 'rgba(2,5,18,0.7)'; ctx.shadowBlur = 50 * k;
+    if (r.rot) ctx.shadowOffsetX = 18 * k; else ctx.shadowOffsetY = 18 * k;
+    roundRect(ctx, -PAD, -PAD, WORLD_W, WORLD_H, 24); ctx.fillStyle = '#140c07'; ctx.fill();
     ctx.restore();
 
-    // graphite rails
-    const rail = ctx.createLinearGradient(0, -PAD, 0, H + PAD);
-    rail.addColorStop(0, '#454B57'); rail.addColorStop(0.06, '#30353E'); rail.addColorStop(0.5, '#262A32');
-    rail.addColorStop(0.94, '#1E2127'); rail.addColorStop(1, '#15171B');
-    roundRect(ctx, -PAD, -PAD, WORLD_W, WORLD_H, 26); ctx.fillStyle = rail; ctx.fill();
-    roundRect(ctx, -PAD + 1.2, -PAD + 1.2, WORLD_W - 2.4, WORLD_H - 2.4, 25);
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 1.2; ctx.stroke();
-    // steel lip where rail meets cushion
-    roundRect(ctx, -27.5, -27.5, W + 55, H + 55, 7); ctx.fillStyle = '#0F1115'; ctx.fill();
-    roundRect(ctx, -27.5, -27.5, W + 55, H + 55, 7); ctx.strokeStyle = 'rgba(190,200,215,0.28)'; ctx.lineWidth = 1; ctx.stroke();
-
-    // cushions
-    roundRect(ctx, -24, -24, W + 48, H + 48, 5); ctx.fillStyle = '#174F8D'; ctx.fill();
-
-    // tournament-blue cloth (play area + pocket channels)
-    ctx.beginPath();
-    BOUNDARY.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
-    ctx.closePath();
-    const cloth = ctx.createRadialGradient(W / 2, H / 2, 30, W / 2, H / 2, W * 0.64);
-    cloth.addColorStop(0, '#2B7DD2'); cloth.addColorStop(0.55, '#1F66B8'); cloth.addColorStop(1, '#19549A');
-    ctx.fillStyle = cloth; ctx.fill();
-    ctx.save(); ctx.clip();
-    ctx.strokeStyle = 'rgba(4,16,40,0.32)'; ctx.lineWidth = 9; ctx.stroke();
-    // faint weave
-    ctx.globalAlpha = 0.035; ctx.strokeStyle = '#fff'; ctx.lineWidth = 0.6;
-    for (let x = -50; x < W + 20; x += 5) { ctx.beginPath(); ctx.moveTo(x, -20); ctx.lineTo(x + 30, H + 20); ctx.stroke(); }
+    // walnut rails, each with its own grain direction and a rounded top
+    const O = PAD, I = 24;
+    const rails = [
+      { pts: [[-O, -O], [W + O, -O], [W + I, -I], [-I, -I]], g: [0, -O, 0, -I], along: 'x' },
+      { pts: [[-I, H + I], [W + I, H + I], [W + O, H + O], [-O, H + O]], g: [0, H + O, 0, H + I], along: 'x' },
+      { pts: [[-O, -O], [-I, -I], [-I, H + I], [-O, H + O]], g: [-O, 0, -I, 0], along: 'y' },
+      { pts: [[W + I, -I], [W + O, -O], [W + O, H + O], [W + I, H + I]], g: [W + O, 0, W + I, 0], along: 'y' },
+    ];
+    ctx.save(); roundRect(ctx, -O, -O, WORLD_W, WORLD_H, 24); ctx.clip();
+    let seed = 7; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+    for (const rail of rails) {
+      ctx.save();
+      ctx.beginPath(); rail.pts.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath(); ctx.clip();
+      const gr = ctx.createLinearGradient(...rail.g);
+      gr.addColorStop(0, '#24140b'); gr.addColorStop(0.35, '#3f2614'); gr.addColorStop(0.75, '#4c2e19'); gr.addColorStop(0.93, '#5c3a21'); gr.addColorStop(1, '#2a180c');
+      ctx.fillStyle = gr; ctx.fillRect(-O, -O, WORLD_W, WORLD_H);
+      for (let i = 0; i < 90; i++) {
+        const dark = rnd() < 0.6;
+        ctx.strokeStyle = dark ? `rgba(18,8,2,${0.12 + rnd() * 0.22})` : `rgba(160,105,60,${0.05 + rnd() * 0.1})`;
+        ctx.lineWidth = 0.4 + rnd() * 1.4;
+        ctx.beginPath();
+        if (rail.along === 'x') {
+          const y = rail.g[1] + (rail.g[3] - rail.g[1]) * rnd(), w = (rnd() - 0.5) * 4;
+          ctx.moveTo(-O, y); ctx.bezierCurveTo(W * 0.3, y + w, W * 0.6, y - w, W + O, y + w * 0.5);
+        } else {
+          const x = rail.g[0] + (rail.g[2] - rail.g[0]) * rnd(), w = (rnd() - 0.5) * 4;
+          ctx.moveTo(x, -O); ctx.bezierCurveTo(x + w, H * 0.3, x - w, H * 0.6, x + w * 0.5, H + O);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
     ctx.restore();
-    ctx.beginPath();
-    BOUNDARY.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1])));
-    ctx.closePath();
-    ctx.strokeStyle = 'rgba(255,255,255,0.08)'; ctx.lineWidth = 1.2; ctx.stroke();
-
-    // markings
-    ctx.strokeStyle = 'rgba(255,255,255,0.14)'; ctx.lineWidth = 1.2; ctx.setLineDash([6, 7]);
-    ctx.beginPath(); ctx.moveTo(HEAD_X, 6); ctx.lineTo(HEAD_X, H - 6); ctx.stroke(); ctx.setLineDash([]);
-    ctx.fillStyle = 'rgba(255,255,255,0.4)';
-    for (const x of [HEAD_X, FOOT_X]) { ctx.beginPath(); ctx.arc(x, H / 2, 2.3, 0, Math.PI * 2); ctx.fill(); }
-
-    // pockets cut into the rails
-    ctx.save();
-    ctx.beginPath(); ctx.rect(-PAD, -PAD, WORLD_W, WORLD_H); roundRect(ctx, -24, -24, W + 48, H + 48, 5);
-    ctx.clip('evenodd');
-    for (const p of POCKETS) { ctx.fillStyle = '#0C0E12'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 9, 0, Math.PI * 2); ctx.fill(); }
-    ctx.restore();
-    for (const p of POCKETS) {
-      const g = ctx.createRadialGradient(p.x, p.y, 2, p.x, p.y, p.r + 3);
-      g.addColorStop(0, '#000'); g.addColorStop(0.8, '#05070A'); g.addColorStop(1, '#1A1E26');
-      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 3, 0, Math.PI * 2); ctx.fill();
+    // satin finish: a soft sheen along the outer edge and a dark mitre where rails meet
+    roundRect(ctx, -O + 1, -O + 1, WORLD_W - 2, WORLD_H - 2, 23); ctx.strokeStyle = 'rgba(255,214,170,0.16)'; ctx.lineWidth = 1.4; ctx.stroke();
+    ctx.strokeStyle = 'rgba(10,4,0,0.35)'; ctx.lineWidth = 0.8;
+    for (const [a, b] of [[[-O, -O], [-I, -I]], [[W + O, -O], [W + I, -I]], [[-O, H + O], [-I, H + I]], [[W + O, H + O], [W + I, H + I]]]) {
+      ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke();
     }
 
-    // sights
-    ctx.fillStyle = 'rgba(245,247,251,0.85)';
-    const sight = (x, y) => { ctx.beginPath(); ctx.arc(x, y, 2.6, 0, Math.PI * 2); ctx.fill(); };
-    for (let i = 1; i < 8; i++) { if (i === 4) continue; sight(W * i / 8, -38); sight(W * i / 8, H + 38); }
-    for (let i = 1; i < 4; i++) { sight(-38, H * i / 4); sight(W + 38, H * i / 4); }
+    // cushion rubber under the cloth
+    roundRect(ctx, -I, -I, W + 2 * I, H + 2 * I, 3);
+    ctx.fillStyle = '#195aa2'; ctx.fill();
+    ctx.strokeStyle = 'rgba(8,4,2,0.75)'; ctx.lineWidth = 1.6; ctx.stroke();
+
+    // the bed: lit by a long lamp above the middle of the table
+    boundaryPath(ctx);
+    ctx.fillStyle = `rgb(${CLOTH[0]},${CLOTH[1]},${CLOTH[2]})`; ctx.fill();
+    ctx.save(); boundaryPath(ctx); ctx.clip();
+    for (const cx of [W * 0.3, W * 0.7]) {
+      const g = ctx.createRadialGradient(cx, H / 2, 10, cx, H / 2, W * 0.42);
+      g.addColorStop(0, 'rgba(120,180,255,0.20)'); g.addColorStop(1, 'rgba(120,180,255,0)');
+      ctx.fillStyle = g; ctx.fillRect(-40, -40, W + 80, H + 80);
+    }
+    const vig = ctx.createRadialGradient(W / 2, H / 2, H * 0.4, W / 2, H / 2, W * 0.62);
+    vig.addColorStop(0, 'rgba(0,10,40,0)'); vig.addColorStop(1, 'rgba(0,10,40,0.34)');
+    ctx.fillStyle = vig; ctx.fillRect(-40, -40, W + 80, H + 80);
+    // felt texture in screen pixels
+    if (!feltTile) feltTile = makeFeltTile();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalCompositeOperation = 'overlay'; ctx.globalAlpha = 0.22;
+    ctx.fillStyle = ctx.createPattern(feltTile, 'repeat'); ctx.fillRect(0, 0, cv.width, cv.height);
+    ctx.globalCompositeOperation = 'source-over'; ctx.globalAlpha = 1;
+    world();
+    // shadow under the cushion noses
+    boundaryPath(ctx); ctx.strokeStyle = 'rgba(2,14,40,0.38)'; ctx.lineWidth = 9; ctx.stroke();
+    ctx.strokeStyle = 'rgba(2,14,40,0.25)'; ctx.lineWidth = 4; ctx.stroke();
+    ctx.restore();
+
+    // cushion faces: lit tops and a bright nose line
+    ctx.save();
+    roundRect(ctx, -I, -I, W + 2 * I, H + 2 * I, 3);
+    BOUNDARY.forEach((p, i) => (i ? ctx.lineTo(p[0], p[1]) : ctx.moveTo(p[0], p[1]))); ctx.closePath();
+    ctx.clip('evenodd');
+    boundaryPath(ctx);
+    ctx.strokeStyle = 'rgba(160,205,255,0.20)'; ctx.lineWidth = 14; ctx.stroke();
+    ctx.strokeStyle = 'rgba(200,228,255,0.30)'; ctx.lineWidth = 4; ctx.stroke();
+    ctx.restore();
+    boundaryPath(ctx); ctx.strokeStyle = 'rgba(225,240,255,0.35)'; ctx.lineWidth = 0.9; ctx.stroke();
+
+    // spots
+    for (const x of [HEAD_X, FOOT_X]) {
+      ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.beginPath(); ctx.arc(x + 0.4, H / 2 + 0.6, 2.8, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = 'rgba(240,244,250,0.85)'; ctx.beginPath(); ctx.arc(x, H / 2, 2.5, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // pockets: polished castings on the rails, rubber liners, deep holes
+    ctx.save();
+    ctx.beginPath(); ctx.rect(-O - 5, -O - 5, WORLD_W + 10, WORLD_H + 10); rrect(ctx, -I, -I, W + 2 * I, H + 2 * I, 3);
+    ctx.clip('evenodd');
+    ctx.save(); roundRect(ctx, -O, -O, WORLD_W, WORLD_H, 24); ctx.clip();
+    for (const p of POCKETS) {
+      const corner = p.r > 23, rad = p.r + (corner ? 13 : 10);
+      const g = ctx.createLinearGradient(p.x - rad, p.y - rad, p.x + rad, p.y + rad);
+      g.addColorStop(0, '#c9ced5'); g.addColorStop(0.4, '#8a919b'); g.addColorStop(0.6, '#a9b0b9'); g.addColorStop(1, '#4b5058');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, rad, 0, Math.PI * 2); ctx.fill();
+      ctx.strokeStyle = 'rgba(15,10,6,0.7)'; ctx.lineWidth = 1; ctx.stroke();
+      ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 0.7; ctx.beginPath(); ctx.arc(p.x, p.y, rad - 1.2, Math.PI * 1.05, Math.PI * 1.6); ctx.stroke();
+      ctx.fillStyle = '#121214'; ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 5.5, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.restore();
+    ctx.restore();
+    for (const p of POCKETS) {
+      const g = ctx.createRadialGradient(p.x, p.y, 1, p.x, p.y, p.r + 3.5);
+      g.addColorStop(0, '#000'); g.addColorStop(0.7, '#020203'); g.addColorStop(0.92, '#121318'); g.addColorStop(1, '#2a2c33');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(p.x, p.y, p.r + 3.5, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // mother-of-pearl sights
+    const sight = (x, y) => {
+      ctx.fillStyle = 'rgba(0,0,0,0.35)'; ctx.beginPath(); ctx.moveTo(x + 0.5, y - 4); ctx.lineTo(x + 3.5, y + 0.5); ctx.lineTo(x + 0.5, y + 5); ctx.lineTo(x - 2.5, y + 0.5); ctx.closePath(); ctx.fill();
+      const g = ctx.createLinearGradient(x - 3, y - 4, x + 3, y + 4);
+      g.addColorStop(0, '#ffffff'); g.addColorStop(0.5, '#dfe6ee'); g.addColorStop(1, '#b6c3d3');
+      ctx.fillStyle = g; ctx.beginPath(); ctx.moveTo(x, y - 4.5); ctx.lineTo(x + 3, y); ctx.lineTo(x, y + 4.5); ctx.lineTo(x - 3, y); ctx.closePath(); ctx.fill();
+    };
+    for (let i = 1; i < 8; i++) { if (i === 4) continue; sight(W * i / 8, -37); sight(W * i / 8, H + 37); }
+    for (let i = 1; i < 4; i++) { sight(-37, H * i / 4); sight(W + 37, H * i / 4); }
     r.layer = cv;
   }
 
-  function buildSprites(r) {
-    const k = r.dpr * r.scale, size = Math.ceil((2 * R + 2) * k);
-    const draw = (n) => {
-      const cv = document.createElement('canvas'); cv.width = cv.height = size;
-      const ctx = cv.getContext('2d');
-      ctx.setTransform(k, 0, 0, k, size / 2, size / 2);
-      ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI * 2);
-      ctx.fillStyle = n === 0 ? '#F7F6F1' : (n > 8 ? IVORY : colorOf(n)); ctx.fill();
-      if (n > 8) {
-        ctx.save(); ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI * 2); ctx.clip();
-        ctx.fillStyle = colorOf(n); ctx.fillRect(-R, -R * 0.56, 2 * R, R * 1.12); ctx.restore();
-      }
-      if (n > 0) {
-        ctx.beginPath(); ctx.arc(0, 0, R * 0.47, 0, Math.PI * 2); ctx.fillStyle = IVORY; ctx.fill();
-        ctx.fillStyle = '#141414';
-        ctx.font = `800 ${n > 9 ? R * 0.54 : R * 0.62}px Archivo, system-ui, sans-serif`;
-        ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-        ctx.fillText(String(n), 0, R * 0.05);
-      }
-      const sh = ctx.createRadialGradient(-R * 0.35, -R * 0.42, 0, 0, 0, R);
-      sh.addColorStop(0, 'rgba(255,255,255,0.8)'); sh.addColorStop(0.16, 'rgba(255,255,255,0.2)');
-      sh.addColorStop(0.5, 'rgba(255,255,255,0)'); sh.addColorStop(0.82, 'rgba(0,0,0,0.12)'); sh.addColorStop(1, 'rgba(0,0,0,0.45)');
-      ctx.beginPath(); ctx.arc(0, 0, R, 0, Math.PI * 2); ctx.fillStyle = sh; ctx.fill();
-      return cv;
-    };
-    for (let n = 0; n <= 15; n++) r.sprites[n] = draw(n);
-    const scv = document.createElement('canvas'); scv.width = scv.height = Math.ceil(R * 3 * k);
-    const sctx = scv.getContext('2d');
-    const g = sctx.createRadialGradient(scv.width / 2, scv.height / 2, 0, scv.width / 2, scv.height / 2, scv.width / 2);
-    g.addColorStop(0, 'rgba(0,8,30,0.55)'); g.addColorStop(0.55, 'rgba(0,8,30,0.25)'); g.addColorStop(1, 'rgba(0,8,30,0)');
+  // ---------- 3D balls that roll ----------
+  // Each ball keeps an orientation (body -> world rotation). Every frame the ball is turned by
+  // its rolling velocity, then shaded per pixel: stripes, number discs and highlights all move
+  // like the real thing. Lighting is fixed to the screen so highlights stay put while balls roll.
+  const BALL_RGB = { 0: [246, 244, 236], 1: [242, 183, 5], 2: [29, 79, 168], 3: [200, 16, 46], 4: [91, 42, 134], 5: [238, 108, 27], 6: [15, 122, 61], 7: [123, 36, 24], 8: [22, 22, 24] };
+  const IVORY_RGB = [244, 241, 232];
+  const DISC_COS = Math.cos(0.5), DISC_SIN = Math.sin(0.5), STRIPE_W = 0.55, DOT_COS = Math.cos(0.12);
+  const G = 48, glyphs = {};
+  function buildGlyphs() {
+    const cv = document.createElement('canvas'); cv.width = cv.height = G;
+    const ctx = cv.getContext('2d');
+    for (let n = 1; n <= 15; n++) {
+      ctx.clearRect(0, 0, G, G); ctx.fillStyle = '#000';
+      ctx.font = `800 ${n > 9 ? 25 : 29}px Archivo, system-ui, sans-serif`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      if (n > 9) { ctx.save(); ctx.translate(G / 2, G / 2 + 1.5); ctx.scale(0.86, 1); ctx.fillText(String(n), 0, 0); ctx.restore(); }
+      else ctx.fillText(String(n), G / 2, G / 2 + 1.5);
+      if (n === 6 || n === 9) ctx.fillRect(G / 2 - 6, G / 2 + 13, 12, 2.2); // tell 6 and 9 apart
+      const d = ctx.getImageData(0, 0, G, G).data, a = new Uint8Array(G * G);
+      for (let i = 0; i < G * G; i++) a[i] = d[i * 4 + 3];
+      glyphs[n] = a;
+    }
+  }
+  function makeOrients() { return { m: {}, ver: {} }; }
+  function resetOrient(set, n, rand) {
+    // number facing up with a little tilt, turned to a random angle in the table plane
+    const a = rand() * Math.PI * 2, t1 = (rand() - 0.5) * 0.7, t2 = (rand() - 0.5) * 0.7;
+    let m = [Math.cos(a), -Math.sin(a), 0, Math.sin(a), Math.cos(a), 0, 0, 0, 1];
+    m = mul3(rotAxis(1, 0, 0, t1), m); m = mul3(rotAxis(0, 1, 0, t2), m);
+    set.m[n] = m; set.ver[n] = (set.ver[n] || 0) + 1;
+  }
+  function resetAll(set) { for (let n = 0; n <= 15; n++) resetOrient(set, n, Math.random); }
+  function rotAxis(x, y, z, t) {
+    const c = Math.cos(t), s = Math.sin(t), v = 1 - c;
+    return [c + x * x * v, x * y * v - z * s, x * z * v + y * s, y * x * v + z * s, c + y * y * v, y * z * v - x * s, z * x * v - y * s, z * y * v + x * s, c + z * z * v];
+  }
+  function mul3(a, b) {
+    const o = new Array(9);
+    for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) o[i * 3 + j] = a[i * 3] * b[j] + a[i * 3 + 1] * b[3 + j] + a[i * 3 + 2] * b[6 + j];
+    return o;
+  }
+  function orthonormalize(m) {
+    let ax = m[0], ay = m[3], az = m[6], l = Math.sqrt(ax * ax + ay * ay + az * az); ax /= l; ay /= l; az /= l;
+    let bx = m[1], by = m[4], bz = m[7]; const d = ax * bx + ay * by + az * bz; bx -= d * ax; by -= d * ay; bz -= d * az;
+    l = Math.sqrt(bx * bx + by * by + bz * bz); bx /= l; by /= l; bz /= l;
+    const cx = ay * bz - az * by, cy = az * bx - ax * bz, cz = ax * by - ay * bx;
+    m[0] = ax; m[3] = ay; m[6] = az; m[1] = bx; m[4] = by; m[7] = bz; m[2] = cx; m[5] = cy; m[8] = cz;
+  }
+  // turn every moving ball by how far its surface rolled this frame
+  function rollBalls(set, balls, dt) {
+    for (const b of balls) {
+      if (b.in) continue;
+      const rx = b.rx || 0, ry = b.ry || 0, sp = Math.sqrt(rx * rx + ry * ry);
+      if (sp < 0.5) continue;
+      if (!set.m[b.n]) resetOrient(set, b.n, Math.random);
+      // world: x right, y down, z into the table. Rolling without slip: w = (ry, -rx, 0) / R
+      const ang = sp * dt / R;
+      set.m[b.n] = mul3(rotAxis(ry / sp, -rx / sp, 0, ang), set.m[b.n]);
+      set.ver[b.n]++;
+      if (set.ver[b.n] % 30 === 0) orthonormalize(set.m[b.n]);
+    }
+  }
+
+  function buildBallPixels(r) {
+    // per-pixel normals and lighting for one ball sprite at this size
+    const k = r.dpr * r.scale, rho = R * k, S = Math.ceil(2 * rho) + 4, c = S / 2;
+    const L = [[-0.2, -0.42, -0.885], [0.06, -0.44, -0.896]].map((v) => { const l = Math.hypot(...v); return v.map((x) => x / l); });
+    const Lm = (() => { const v = [-0.18, -0.36, -0.92], l = Math.hypot(...v); return v.map((x) => x / l); })();
+    const H2 = L.map((l) => { const h = [l[0], l[1], l[2] - 1], n = Math.hypot(...h); return h.map((x) => x / n); });
+    const list = { S, idx: [], nx: [], ny: [], nz: [], a: [], shade: [], spec: [], bounce: [] };
+    for (let j = 0; j < S; j++) for (let i = 0; i < S; i++) {
+      const dx = (i + 0.5 - c) / rho, dy = (j + 0.5 - c) / rho, d2 = dx * dx + dy * dy;
+      const dist = Math.sqrt(d2), a = Math.max(0, Math.min(1, (1 - dist) * rho + 0.5));
+      if (a <= 0) continue;
+      const dd = Math.min(d2, 0.9999), nz = -Math.sqrt(1 - dd), sc = d2 > 0.9999 ? 1 / dist : 1;
+      const nx = dx * sc, ny = dy * sc;
+      const diff = Math.max(0, nx * Lm[0] + ny * Lm[1] + nz * Lm[2]);
+      let spec = 0;
+      for (const h of H2) { const t = Math.max(0, nx * h[0] + ny * h[1] + nz * h[2]); spec += Math.pow(t, 90) * 0.75 + Math.pow(t, 12) * 0.05; }
+      const facing = -nz;
+      list.idx.push((j * S + i) * 4); list.nx.push(nx); list.ny.push(ny); list.nz.push(nz); list.a.push(Math.round(a * 255));
+      list.shade.push((0.34 + 0.7 * diff) * (0.78 + 0.22 * facing));
+      list.spec.push(spec * 255);
+      list.bounce.push(Math.pow(1 - facing, 2) * 0.28);
+    }
+    r.px = list; r.ballCache = {};
+    const scv = document.createElement('canvas'); scv.width = scv.height = Math.ceil(R * 3.2 * k);
+    const sctx = scv.getContext('2d'), sc = scv.width / 2;
+    const g = sctx.createRadialGradient(sc, sc, 0, sc, sc, sc);
+    g.addColorStop(0, 'rgba(0,6,24,0.62)'); g.addColorStop(0.42, 'rgba(0,6,24,0.42)'); g.addColorStop(0.7, 'rgba(0,6,24,0.12)'); g.addColorStop(1, 'rgba(0,6,24,0)');
     sctx.fillStyle = g; sctx.fillRect(0, 0, scv.width, scv.height);
     r.shadow = scv;
   }
 
+  function ballSprite(r, n) {
+    const P = r.px, set = r.orient;
+    if (!set.m[n]) resetOrient(set, n, Math.random);
+    let c = r.ballCache[n];
+    if (!c) {
+      const cv = document.createElement('canvas'); cv.width = cv.height = P.S;
+      const ctx = cv.getContext('2d');
+      c = r.ballCache[n] = { cv, ctx, img: ctx.createImageData(P.S, P.S), ver: -1 };
+    }
+    if (c.ver === set.ver[n]) return c.cv;
+    c.ver = set.ver[n];
+    const M = set.m[n], d = c.img.data, glyph = glyphs[n];
+    const base = n > 8 ? BALL_RGB[n - 8] : BALL_RGB[n], stripe = n > 8, cue = n === 0;
+    const rot = r.rot, cnt = P.idx.length;
+    for (let q = 0; q < cnt; q++) {
+      let wx = P.nx[q], wy = P.ny[q]; const wz = P.nz[q];
+      if (rot) { const t = wx; wx = wy; wy = -t; } // screen -> world when the table is stood on end
+      const px = M[0] * wx + M[3] * wy + M[6] * wz, py = M[1] * wx + M[4] * wy + M[7] * wz, pz = M[2] * wx + M[5] * wy + M[8] * wz;
+      let cr = base[0], cg = base[1], cb = base[2];
+      if (cue) {
+        if (px > DOT_COS || px < -DOT_COS || py > DOT_COS || py < -DOT_COS || pz > DOT_COS || pz < -DOT_COS) { cr = 190; cg = 24; cb = 40; }
+      } else {
+        if (stripe && (px > STRIPE_W || px < -STRIPE_W)) { cr = IVORY_RGB[0]; cg = IVORY_RGB[1]; cb = IVORY_RGB[2]; }
+        if (pz > DISC_COS || pz < -DISC_COS) {
+          cr = IVORY_RGB[0]; cg = IVORY_RGB[1]; cb = IVORY_RGB[2];
+          if (glyph) {
+            const u = (pz < 0 ? px : -px) / DISC_SIN, v = py / DISC_SIN;
+            const gx = (u * 0.5 + 0.5) * G | 0, gy = (v * 0.5 + 0.5) * G | 0;
+            if (gx >= 0 && gx < G && gy >= 0 && gy < G) {
+              const t = glyph[gy * G + gx] / 255;
+              cr += (20 - cr) * t; cg += (20 - cg) * t; cb += (22 - cb) * t;
+            }
+          }
+        }
+      }
+      const sh = P.shade[q], sp = P.spec[q], bo = P.bounce[q], i = P.idx[q];
+      d[i] = Math.min(255, cr * sh + sp + CLOTH[0] * bo);
+      d[i + 1] = Math.min(255, cg * sh + sp + CLOTH[1] * bo);
+      d[i + 2] = Math.min(255, cb * sh + sp + CLOTH[2] * bo);
+      d[i + 3] = P.a[q];
+    }
+    c.ctx.putImageData(c.img, 0, 0);
+    return c.cv;
+  }
+
   function drawBall(r, n, x, y, scale, alpha) {
-    const ctx = r.ctx, s = (2 * R + 2) * (scale || 1);
+    const ctx = r.ctx, sprite = ballSprite(r, n), k = r.dpr * r.scale, s = sprite.width / k * (scale || 1);
     if (alpha !== undefined) ctx.globalAlpha = alpha;
-    if (r.rot) { // keep numbers upright on screen
-      ctx.save(); ctx.translate(x, y); ctx.rotate(-Math.PI / 2); ctx.drawImage(r.sprites[n], -s / 2, -s / 2, s, s); ctx.restore();
-    } else ctx.drawImage(r.sprites[n], x - s / 2, y - s / 2, s, s);
+    if (r.rot) { ctx.save(); ctx.translate(x, y); ctx.rotate(-Math.PI / 2); ctx.drawImage(sprite, -s / 2, -s / 2, s, s); ctx.restore(); }
+    else ctx.drawImage(sprite, x - s / 2, y - s / 2, s, s);
     ctx.globalAlpha = 1;
   }
   function drawShadow(r, x, y) {
-    const sx = x + (x - W / 2) * 0.01 + 1.5, sy = y + (y - H / 2) * 0.016 + 3, s = R * 3;
-    r.ctx.drawImage(r.shadow, sx - s / 2, sy - s / 2, s, s);
+    // light hangs above, so shadows sit just below each ball on screen
+    const ox = 1.2, oy = 2.4, wx = r.rot ? oy : ox, wy = r.rot ? -ox : oy, s = R * 3.2;
+    r.ctx.drawImage(r.shadow, x + wx - s / 2, y + wy - s / 2, s, s);
   }
 
-  // a modern carbon cue; the joint ring wears the shooter's colour
+  // a classic two-piece cue: chalked tip, maple shaft, ebony forearm with points, linen wrap.
+  // The joint ring wears the shooter's colour.
   function drawCue(r, cx, cy, dx, dy, gap, alpha, ring) {
     const ctx = r.ctx;
     ctx.save(); ctx.globalAlpha = alpha;
     ctx.translate(cx, cy); ctx.rotate(Math.atan2(dy, dx));
-    const L = 620, x0 = -gap, w0 = 2.6, w1 = 6.2;
+    const L = 640, x0 = -gap, w0 = 2.5, w1 = 6.4;
+    const wAt = (x) => w0 + (w1 - w0) * ((x0 - x) / L);
     const seg = (a, b, fill) => {
-      const wa = w0 + (w1 - w0) * ((x0 - a) / L), wb = w0 + (w1 - w0) * ((x0 - b) / L);
+      const wa = wAt(a), wb = wAt(b);
       ctx.beginPath(); ctx.moveTo(a, -wa); ctx.lineTo(b, -wb); ctx.lineTo(b, wb); ctx.lineTo(a, wa); ctx.closePath();
       ctx.fillStyle = fill; ctx.fill();
     };
-    ctx.shadowColor = 'rgba(0,6,24,0.45)'; ctx.shadowBlur = 9; ctx.shadowOffsetY = 7;
-    const carbon = ctx.createLinearGradient(0, -6, 0, 6);
-    carbon.addColorStop(0, '#5B616D'); carbon.addColorStop(0.35, '#2A2E36'); carbon.addColorStop(1, '#0E1014');
-    seg(x0 - 9, x0 - L, carbon);
-    ctx.shadowColor = 'transparent';
-    const sleeve = ctx.createLinearGradient(0, -6, 0, 6);
-    sleeve.addColorStop(0, '#E9ECF2'); sleeve.addColorStop(0.5, '#B9C0CC'); sleeve.addColorStop(1, '#7E8796');
-    seg(x0 - 470, x0 - 560, sleeve);
-    seg(x0 - 340, x0 - 352, ring || PLAYER[0]);
-    seg(x0 - 2.5, x0 - 9, '#F3F4F6');
-    seg(x0, x0 - 2.5, '#2F6FB5');
+    const across = (stops) => { const g = ctx.createLinearGradient(0, -6.5, 0, 6.5); stops.forEach((c, i) => g.addColorStop(i / (stops.length - 1), c)); return g; };
+    // shadow on the cloth
+    ctx.save(); ctx.shadowColor = 'rgba(0,6,24,0.5)'; ctx.shadowBlur = 10; ctx.shadowOffsetY = 8;
+    seg(x0, x0 - L, '#000'); ctx.restore();
+    seg(x0 - 11, x0 - 330, across(['#b8945e', '#f1dcb2', '#e2c38d', '#a47f4a']));          // maple shaft
+    seg(x0 - 330, x0 - 341, across(['#7d848f', '#eef1f5', '#b9bfc8', '#5d636c']));         // steel joint
+    seg(x0 - 341, x0 - 346, ring || PLAYER[0]);                                            // player ring
+    seg(x0 - 346, x0 - 505, across(['#0c0705', '#3a2519', '#1d120b', '#070403']));         // ebony forearm
+    ctx.save(); // maple points running toward the joint
+    ctx.beginPath(); ctx.moveTo(x0 - 505, -wAt(x0 - 505) * 0.7); ctx.lineTo(x0 - 372, 0); ctx.lineTo(x0 - 505, wAt(x0 - 505) * 0.7); ctx.closePath();
+    ctx.fillStyle = across(['#9c7a48', '#ecd3a3', '#c9a46b']); ctx.fill(); ctx.restore();
+    seg(x0 - 505, x0 - 592, across(['#141416', '#3a3b40', '#232428', '#0d0d0f']));         // linen wrap
+    ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.07)'; ctx.lineWidth = 0.6;
+    for (let x = x0 - 507; x > x0 - 590; x -= 2.2) { const w = wAt(x); ctx.beginPath(); ctx.moveTo(x, -w); ctx.lineTo(x - 2, w); ctx.stroke(); }
+    ctx.restore();
+    seg(x0 - 592, x0 - 598, ring || PLAYER[0]);
+    seg(x0 - 598, x0 - 633, across(['#0c0705', '#3a2519', '#1d120b', '#070403']));         // butt sleeve
+    seg(x0 - 633, x0 - L, '#0a0a0b');                                                      // bumper
+    seg(x0 - 3, x0 - 11, across(['#c9c4b8', '#fbf9f4', '#e7e2d6', '#a8a396']));           // ferrule
+    seg(x0, x0 - 3, across(['#1f4f86', '#3f86cf', '#2c6aaa']));                            // chalked tip
+    // long highlight down the top of the cue
+    ctx.beginPath(); ctx.moveTo(x0 - 12, -wAt(x0 - 12) * 0.45); ctx.lineTo(x0 - L + 8, -wAt(x0 - L + 8) * 0.45);
+    ctx.strokeStyle = 'rgba(255,255,255,0.22)'; ctx.lineWidth = 0.9; ctx.stroke();
     ctx.restore();
   }
 
@@ -327,7 +539,11 @@
     const placing = !anim && s.ballInHand && s.phase !== 'over';
     const ring = PLAYER[s.turn];
 
-    if (placing && s.kitchen && (myTurn() || app.remote.place)) { ctx.fillStyle = 'rgba(255,255,255,0.04)'; ctx.fillRect(0, 0, HEAD_X, H); }
+    if (placing && s.kitchen) {
+      ctx.fillStyle = 'rgba(255,255,255,0.035)'; ctx.fillRect(0, 0, HEAD_X, H);
+      ctx.save(); ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1.2; ctx.setLineDash([6, 7]);
+      ctx.beginPath(); ctx.moveTo(HEAD_X, 4); ctx.lineTo(HEAD_X, H - 4); ctx.stroke(); ctx.restore();
+    }
     for (const b of balls) { const p = (b.n === 0 && cp) ? cp : b; drawShadow(r, p.x, p.y); }
     for (const b of balls) { const p = (b.n === 0 && cp) ? cp : b; drawBall(r, b.n, p.x, p.y); }
     app.potAnims = app.potAnims.filter((a) => now - a.t0 < 0.24);
@@ -344,10 +560,10 @@
           drawGuide(r, cp.x, cp.y, app.aim.dx, app.aim.dy, s.balls, 1);
           drawCue(r, cp.x, cp.y, app.aim.dx, app.aim.dy, R + 4 + app.power * 80, 1, ring);
         }
-      } else if (!myTurn() && app.remote.aim) {
-        const a = app.remote.aim;
-        drawGuide(r, cp.x, cp.y, a.dx, a.dy, s.balls, 0.5);
-        drawCue(r, cp.x, cp.y, a.dx, a.dy, R + 4 + a.power * 80, 0.85, ring);
+      } else if (!myTurn() && app.remote.view) {
+        const v = app.remote.view, dx = Math.cos(v.ang), dy = Math.sin(v.ang);
+        drawGuide(r, cp.x, cp.y, dx, dy, s.balls, 0.5);
+        drawCue(r, cp.x, cp.y, dx, dy, R + 4 + v.power * 80, 0.85, ring);
       }
     }
     const st = app.strike;
@@ -414,7 +630,9 @@
     const elapsed = now - app.strike.t0;
     app.anim = { sim: C.createSim(start, input), result, score, acc: 0, delay: Math.max(0, 0.09 - elapsed), ev: 0, played: false, power: input.power };
     app.pending = false; clearTimeout(app.pendingTimer);
-    app.remote.aim = null; app.remote.place = null; app.power = 0; app.charging = false;
+    app.remote.aim = null; app.remote.place = null; app.remote.view = null; app.remote.placeView = null;
+    app.power = 0; app.charging = false;
+    lastCaption = app.mode === 'online' && isMe(start.turn) ? 'Your shot.' : `${seatName(start.turn)}’s shot.`;
     updateHUD();
   }
 
@@ -425,7 +643,9 @@
     a.acc += dt;
     let steps = Math.floor(a.acc / C.DT);
     a.acc -= steps * C.DT;
-    while (steps-- > 0 && !a.sim.done) C.stepSim(a.sim);
+    let ran = 0;
+    while (steps-- > 0 && !a.sim.done) { C.stepSim(a.sim); ran++; }
+    rollBalls(tableR.orient, a.sim.balls, ran * C.DT);
     const ev = a.sim.events;
     for (; a.ev < ev.length; a.ev++) {
       const e = ev[a.ev];
@@ -450,8 +670,8 @@
     const c = cueBall(st);
     app.place = st.ballInHand ? { x: c.x, y: c.y } : null;
     app.power = 0; app.spin = 0; app.charging = false;
-    app.remote.place = null;
-    if (st.shotNo === 0) app.aim = { dx: 1, dy: 0 };
+    app.remote.place = null; app.remote.placeView = null; app.remote.aim = null; app.remote.view = null;
+    if (st.shotNo === 0) { app.aim = { dx: 1, dy: 0 }; resetAll(tableR.orient); }
     if (app.mode === 'local' && afterShot && st.phase === 'over' && !wasOver) app.score[st.winner]++;
     updateSpin();
     if (afterShot && st.lastShot) announce(st, st.lastShot);
@@ -493,7 +713,6 @@
     return el;
   }
 
-  let lastCaption = '';
   function updateHUD() {
     const s = app.state;
     for (let seat = 0; seat < 2; seat++) {
@@ -645,6 +864,13 @@
       app.power = Math.max(0, Math.min(1, (l - R * 1.5) / 260));
     }
   });
+  canvas.addEventListener('pointermove', (e) => {
+    if (app.drag) { canvas.style.cursor = app.drag.kind === 'place' ? 'grabbing' : 'crosshair'; return; }
+    if (!canAct()) { canvas.style.cursor = 'default'; return; }
+    const p = tableR.toWorld(e.clientX, e.clientY), c = cuePos();
+    const d = Math.sqrt((p.x - c.x) * (p.x - c.x) + (p.y - c.y) * (p.y - c.y));
+    canvas.style.cursor = app.state.ballInHand && d < R * 2.6 ? 'grab' : 'crosshair';
+  });
   const endCanvasDrag = (e) => {
     const dr = app.drag;
     if (!dr || dr.id !== e.pointerId) return;
@@ -658,22 +884,22 @@
   // power slider: pull and let go
   const powerEl = $('#power'), fill = powerEl.querySelector('.power-fill'), powerOut = $('#power-out');
   const vertical = (el) => { const r = el.getBoundingClientRect(); return r.height >= r.width; };
-  function powerFrom(e) {
-    const r = powerEl.getBoundingClientRect();
-    const v = vertical(powerEl) ? (e.clientY - r.top) / r.height : (e.clientX - r.left) / r.width;
-    return Math.max(0, Math.min(1, v));
-  }
+  // Power is how far you drag, not where you press: start anywhere on the slider and pull.
+  // Pulling 75% of the slider's length (or past its end) gives full power.
+  const POWER_REACH = 0.75;
   let powerDrag = null;
   powerEl.addEventListener('pointerdown', (e) => {
     audio.unlock();
     if (!canAct()) return;
     capture(powerEl, e.pointerId);
-    powerDrag = { id: e.pointerId, start: powerFrom(e) };
+    const r = powerEl.getBoundingClientRect(), vert = r.height >= r.width;
+    powerDrag = { id: e.pointerId, vert, start: vert ? e.clientY : e.clientX, len: (vert ? r.height : r.width) * POWER_REACH };
     app.power = 0; app.aimDirty = true; e.preventDefault();
   });
   powerEl.addEventListener('pointermove', (e) => {
     if (!powerDrag || powerDrag.id !== e.pointerId) return;
-    app.power = Math.max(0, Math.min(1, powerFrom(e) - powerDrag.start));
+    const pos = powerDrag.vert ? e.clientY : e.clientX;
+    app.power = Math.max(0, Math.min(1, (pos - powerDrag.start) / powerDrag.len));
     app.aimDirty = true;
   });
   const endPower = (e) => {
@@ -762,8 +988,8 @@
       if (app.mode !== 'online' || m.gameId !== app.gameId) return;
       beginShot(m.start, m.input, m.result, m.score);
     });
-    socket.on('aim', (a) => { if (app.state && !myTurn()) app.remote.aim = a; });
-    socket.on('place', (p) => { if (app.state && !myTurn()) app.remote.place = p; });
+    socket.on('aim', (a) => { if (app.state && !myTurn() && !app.anim) app.remote.aim = a; });
+    socket.on('place', (p) => { if (app.state && !myTurn() && !app.anim) app.remote.place = p; });
     socket.on('shotRejected', (msg) => { app.pending = false; app.strike = null; showTag('Can’t shoot', String(msg), FOUL); updateHUD(); });
     return socket;
   }
@@ -959,7 +1185,7 @@
   const attract = { state: null, sim: null, wait: 0, shots: 0, pots: [], aim: { dx: 1, dy: 0 }, power: 0, strikeAt: 0 };
   let attractSeed = 5;
   const attractRand = () => (attractSeed = (attractSeed * 16807) % 2147483647) / 2147483647;
-  function attractReset() { attract.state = C.newGame(0, attractRand); attract.sim = null; attract.shots = 0; attract.wait = 1.6; attract.aim = { dx: 1, dy: 0 }; attract.power = 0.95; }
+  function attractReset() { resetAll(attractR.orient); attract.state = C.newGame(0, attractRand); attract.sim = null; attract.shots = 0; attract.wait = 1.6; attract.aim = { dx: 1, dy: 0 }; attract.power = 0.95; }
   function attractPlan() {
     const s = attract.state, cue = s.balls.find((b) => b.n === 0);
     if (attract.shots === 0) { attract.aim = { dx: 1, dy: (attractRand() - 0.5) * 0.02 }; attract.power = 0.95; return; }
@@ -977,7 +1203,9 @@
     if (attract.sim) {
       attract.acc = (attract.acc || 0) + dt;
       let steps = Math.floor(attract.acc / C.DT); attract.acc -= steps * C.DT;
-      while (steps-- > 0 && !attract.sim.done) C.stepSim(attract.sim);
+      let ran = 0;
+      while (steps-- > 0 && !attract.sim.done) { C.stepSim(attract.sim); ran++; }
+      rollBalls(attractR.orient, attract.sim.balls, ran * C.DT);
       for (const e of attract.sim.events) if (e.t === 'pocket') attract.pots.push({ n: e.n, x: e.x, y: e.y, p: e.p, t0: now });
       attract.sim.events.length = 0;
       if (attract.sim.done) {
@@ -1023,6 +1251,26 @@
     }
   }
 
+  // The opponent's aim arrives ~20 times a second; ease toward it so their cue glides.
+  function smoothRemote(dt) {
+    const rm = app.remote, f = 1 - Math.exp(-dt * 16);
+    if (rm.aim) {
+      const target = Math.atan2(rm.aim.dy, rm.aim.dx);
+      if (!rm.view) rm.view = { ang: target, power: rm.aim.power };
+      else {
+        let d = target - rm.view.ang;
+        while (d > Math.PI) d -= 2 * Math.PI;
+        while (d < -Math.PI) d += 2 * Math.PI;
+        rm.view.ang += d * f;
+        rm.view.power += (rm.aim.power - rm.view.power) * f;
+      }
+    }
+    if (rm.place) {
+      if (!rm.placeView) rm.placeView = { x: rm.place.x, y: rm.place.y };
+      else { rm.placeView.x += (rm.place.x - rm.placeView.x) * f; rm.placeView.y += (rm.place.y - rm.placeView.y) * f; }
+    }
+  }
+
   // ------------------------------------------------------------------ loop
   let last = performance.now() / 1000;
   function frame(t) {
@@ -1036,7 +1284,8 @@
     }
     if (app.charging && canAct()) { app.power = Math.min(1, app.power + dt / 1.3); app.aimDirty = true; }
     if (app.anim) stepAnim(dt, now);
-    if (app.mode === 'online' && socket && canAct() && now - app.lastSend > 0.066) {
+    smoothRemote(dt);
+    if (app.mode === 'online' && socket && canAct() && now - app.lastSend > 0.05) {
       if (app.aimDirty) { socket.volatile.emit('aim', { dx: app.aim.dx, dy: app.aim.dy, power: app.power, spin: app.spin }); app.aimDirty = false; app.lastSend = now; }
       if (app.placeDirty && app.place) { socket.volatile.emit('place', app.place); app.placeDirty = false; app.lastSend = now; }
     }
@@ -1054,7 +1303,8 @@
   // ------------------------------------------------------------------ boot
   new ResizeObserver(() => { if (current === 'game') { tableR.resize(); shownPower = -1; } }).observe($('#table-wrap'));
   new ResizeObserver(() => { if (current === 'home') attractR.resize(); }).observe($('.attract'));
-  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { tableR.resize(); attractR.resize(); });
+  buildGlyphs();
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => { buildGlyphs(); tableR.resize(); attractR.resize(); });
   $('#name').value = store.get('pool.name') || '';
   $('#name2').value = store.get('pool.name2') || '';
   const params = new URLSearchParams(location.search);

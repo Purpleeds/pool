@@ -11,11 +11,16 @@
   // ---------- table geometry (world units; play area is W x H) ----------
   const W = 1000, H = 500, R = 12;
   const DT = 1 / 600;                 // physics step (s)
-  const MAX_SPEED = 2700, MIN_SPEED = 40;
-  const ROLL_DECEL = 115;             // constant rolling friction (u/s^2)
-  const DRAG = 0.26;                  // speed-proportional friction (1/s)
-  const BALL_REST = 0.95, RAIL_REST = 0.74, RAIL_GRIP = 0.985;
-  const STOP_SPEED = 5;
+  const MAX_SPEED = 3300, MIN_SPEED = 30;
+  // Each ball has a velocity (vx, vy) and a rolling velocity (rx, ry) = spin x radius.
+  // While they differ the ball skids and sliding friction pulls them together;
+  // once equal it rolls and only the much smaller rolling friction applies.
+  const SLIDE_DECEL = 560;            // sliding friction (u/s^2), fast cloth mu ~0.15
+  const ROLL_DECEL = 62;              // rolling resistance (u/s^2)
+  const DRAG = 0.07;                  // gentle speed-proportional loss (1/s)
+  const SPIN_GAIN = 1.4;              // how hard the spin control bites
+  const BALL_REST = 0.96, RAIL_REST = 0.8, RAIL_GRIP = 0.975, RAIL_SPIN_KEEP = 0.45;
+  const SLIP_EPS = 1.5, STOP_SPEED = 2.5;
   const HEAD_X = W * 0.25, FOOT_X = W * 0.75;
   const CM = 30, SM = 22;             // corner / side pocket mouth sizes
 
@@ -111,21 +116,25 @@
 
   // ---------- simulation ----------
   function shotSpeed(power) {
-    return MIN_SPEED + (MAX_SPEED - MIN_SPEED) * (0.3 * power + 0.7 * power * power);
+    return MIN_SPEED + (MAX_SPEED - MIN_SPEED) * (0.45 * power + 0.55 * power * power);
   }
 
   function createSim(state, input) {
     const balls = state.balls.filter((b) => !b.in).map((b) => ({
-      n: b.n, x: b.x, y: b.y, vx: 0, vy: 0, in: false,
+      n: b.n, x: b.x, y: b.y, vx: 0, vy: 0, rx: 0, ry: 0, in: false,
     }));
     const cue = balls.find((b) => b.n === 0);
     if (cue && input.cue) { cue.x = input.cue.x; cue.y = input.cue.y; }
     const sp = shotSpeed(input.power);
-    if (cue) { cue.vx = input.dx * sp; cue.vy = input.dy * sp; }
+    if (cue) {
+      // centre hit = pure skid (stun); above centre = topspin (follow); below = backspin (draw)
+      const k = SPIN_GAIN * (input.spin || 0);
+      cue.vx = input.dx * sp; cue.vy = input.dy * sp;
+      cue.rx = cue.vx * k; cue.ry = cue.vy * k;
+    }
     return {
       balls, steps: 0, done: false, events: [],
       firstHit: null, railAfterHit: false, potted: [], cuePotted: false,
-      spin: input.spin || 0, spinUsed: false, cueTravel: 0,
     };
   }
 
@@ -137,7 +146,6 @@
       const b = bs[i];
       if (b.in) continue;
       b.x += b.vx * DT; b.y += b.vy * DT;
-      if (b.n === 0 && !sim.spinUsed) sim.cueTravel += Math.sqrt(b.vx * b.vx + b.vy * b.vy) * DT;
     }
     // ball-ball
     for (let i = 0; i < n; i++) {
@@ -154,23 +162,11 @@
         const ov = (2 * R - d) / 2;
         a.x -= nx * ov; a.y -= ny * ov; b.x += nx * ov; b.y += ny * ov;
         if (rel <= 0) continue;
-        const cueBall = a.n === 0 ? a : (b.n === 0 ? b : null);
-        let preVx = 0, preVy = 0;
-        if (cueBall) { preVx = cueBall.vx; preVy = cueBall.vy; }
+        // balls exchange velocity along the line of centres; their spin stays put
         const J = (1 + BALL_REST) / 2 * rel;
         a.vx -= J * nx; a.vy -= J * ny; b.vx += J * nx; b.vy += J * ny;
         sim.events.push({ t: 'ball', s: rel });
-        if (cueBall) {
-          const other = cueBall === a ? b : a;
-          if (sim.firstHit === null) sim.firstHit = other.n;
-          if (!sim.spinUsed) {
-            sim.spinUsed = true;
-            let fade = 1 - sim.cueTravel / 1600;
-            if (fade < 0) fade = 0;
-            const eff = sim.spin * fade * 0.6;
-            cueBall.vx += eff * preVx; cueBall.vy += eff * preVy;
-          }
-        }
+        if (sim.firstHit === null && (a.n === 0 || b.n === 0)) sim.firstHit = a.n === 0 ? b.n : a.n;
       }
     }
     // cushions
@@ -192,6 +188,10 @@
           const tx = b.vx - vn * nx, ty = b.vy - vn * ny;
           b.vx = tx * RAIL_GRIP - vn * RAIL_REST * nx;
           b.vy = ty * RAIL_GRIP - vn * RAIL_REST * ny;
+          // the cushion nose sits above the ball's centre, so it partly reverses roll into it
+          const rn = b.rx * nx + b.ry * ny, rtx = b.rx - rn * nx, rty = b.ry - rn * ny;
+          b.rx = rtx * RAIL_GRIP - rn * RAIL_SPIN_KEEP * nx;
+          b.ry = rty * RAIL_GRIP - rn * RAIL_SPIN_KEEP * ny;
           sim.events.push({ t: 'rail', s: -vn });
           if (sim.firstHit !== null) sim.railAfterHit = true;
         }
@@ -214,27 +214,42 @@
         }
       }
       if (hit >= 0) {
-        b.in = true; b.pocket = hit; b.vx = 0; b.vy = 0;
+        b.in = true; b.pocket = hit; b.vx = 0; b.vy = 0; b.rx = 0; b.ry = 0;
         if (b.n === 0) sim.cuePotted = true; else sim.potted.push(b.n);
         sim.events.push({ t: 'pocket', n: b.n, p: hit, x: b.x, y: b.y });
       }
     }
-    // friction + stop check
+    // friction: skid until spin matches travel, then roll
     let moving = false;
+    const slideStep = SLIDE_DECEL * DT;
     for (let i = 0; i < n; i++) {
       const b = bs[i];
       if (b.in) continue;
+      const sx = b.vx - b.rx, sy = b.vy - b.ry, slip = Math.sqrt(sx * sx + sy * sy);
+      if (slip > SLIP_EPS) {
+        if (3.5 * slideStep >= slip) {
+          // the skid ends this step: 5v + 2r is conserved, so this is the rolling speed
+          const fx = (5 * b.vx + 2 * b.rx) / 7, fy = (5 * b.vy + 2 * b.ry) / 7;
+          b.vx = fx; b.vy = fy; b.rx = fx; b.ry = fy;
+        } else {
+          const ux = sx / slip, uy = sy / slip;
+          b.vx -= ux * slideStep; b.vy -= uy * slideStep;
+          b.rx += 2.5 * ux * slideStep; b.ry += 2.5 * uy * slideStep;
+        }
+        moving = true;
+        continue;
+      }
       const sp = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
-      if (sp === 0) continue;
+      if (sp === 0) { b.rx = 0; b.ry = 0; continue; }
       const ns = sp - (ROLL_DECEL + DRAG * sp) * DT;
-      if (ns <= 0) { b.vx = 0; b.vy = 0; continue; }
+      if (ns <= 0) { b.vx = 0; b.vy = 0; b.rx = 0; b.ry = 0; continue; }
       const k = ns / sp;
-      b.vx *= k; b.vy *= k;
+      b.vx *= k; b.vy *= k; b.rx = b.vx; b.ry = b.vy;
       if (ns > STOP_SPEED) moving = true;
     }
     sim.steps++;
     if (!moving || sim.steps > 600 * 45) {
-      for (let i = 0; i < n; i++) { bs[i].vx = 0; bs[i].vy = 0; }
+      for (let i = 0; i < n; i++) { bs[i].vx = 0; bs[i].vy = 0; bs[i].rx = 0; bs[i].ry = 0; }
       sim.done = true;
     }
   }

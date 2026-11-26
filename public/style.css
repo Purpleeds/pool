@@ -109,15 +109,21 @@ svg { width: 20px; height: 20px; flex: none; }
 .attract canvas { position: absolute; inset: 24px 32px 24px 0; width: calc(100% - 32px); height: calc(100% - 48px); }
 .home-panel {
   grid-column: 1; grid-row: 1; position: relative; z-index: 1;
-  display: flex; flex-direction: column; gap: 18px; padding: 32px 40px 28px 48px;
-  overflow-y: auto; justify-content: center;
+  display: flex; flex-direction: column; gap: clamp(9px, 1.8vh, 18px);
+  padding: clamp(20px, 4vh, 32px) 40px clamp(16px, 3vh, 28px) 48px;
+  overflow-y: auto; justify-content: flex-start;
 }
+/* centre the panel when there's room, but never push the top out of reach when there isn't */
+.home-panel::before, .home-panel::after { content: ''; flex: 1 0 0; margin-top: calc(-1 * clamp(9px, 1.8vh, 18px)); }
+/* no visible scrollbars on the full-screen layouts; they still scroll on very short windows */
+.home-panel, #home, .lobby-body { scrollbar-width: none; -ms-overflow-style: none; }
+.home-panel::-webkit-scrollbar, #home::-webkit-scrollbar, .lobby-body::-webkit-scrollbar { display: none; }
 .home-panel .brand { position: absolute; top: 28px; left: 48px; }
 .display {
-  margin: 56px 0 0; font-weight: 850; font-stretch: var(--wide);
-  font-size: clamp(56px, 6.4vw, 92px); line-height: 0.92; letter-spacing: -0.035em;
+  margin: clamp(46px, 7vh, 64px) 0 0; font-weight: 850; font-stretch: var(--wide);
+  font-size: clamp(46px, min(6.4vw, 9.4vh), 92px); line-height: 0.92; letter-spacing: -0.035em;
 }
-.lede { margin: -4px 0 6px; color: var(--muted); font-size: 17px; max-width: 36ch; }
+.lede { margin: -4px 0 clamp(0px, 0.8vh, 6px); color: var(--muted); font-size: clamp(15px, 2.2vh, 17px); max-width: 36ch; }
 
 .seg { position: relative; display: grid; grid-template-columns: 1fr 1fr; padding: 4px; border-radius: 999px; background: var(--ink-raised); border: 1.5px solid var(--ink-line); }
 .seg button { position: relative; z-index: 1; height: 40px; border: 0; border-radius: 999px; background: transparent; color: var(--muted); font-weight: 700; transition: color 0.2s, background-color 0.2s; }
@@ -397,6 +403,11 @@ svg { width: 20px; height: 20px; flex: none; }
   .defs { grid-template-columns: 1fr; gap: 2px; }
   .defs dd { margin-bottom: 12px; }
   .drawer { padding: 0 22px 28px; }
+}
+@media (max-height: 720px) and (min-aspect-ratio: 1/1) {
+  .home-panel .input, .home-panel .btn { min-height: 44px; height: 44px; }
+  .home-panel .code-cell, .home-panel .join .btn { height: 50px; min-height: 50px; }
+  .home-panel .seg button { height: 36px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
